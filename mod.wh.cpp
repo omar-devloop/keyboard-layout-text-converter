@@ -2,7 +2,7 @@
 // @id              keyboard-layout-text-converter
 // @name            Keyboard Layout Text Converter
 // @description     Convert mistyped text in place with a shortcut, adapting to installed keyboard layouts
-// @version         0.6.1
+// @version         0.0.1
 // @author          OMAR ALAFA
 // @homepage        https://github.com/omar-devloop/keyboard-layout-text-converter
 // @include         explorer.exe
