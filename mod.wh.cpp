@@ -85,6 +85,7 @@ Windows applications.
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cwchar>
 #include <cwctype>
@@ -173,6 +174,8 @@ HWND g_toastHwnd = nullptr;
 HFONT g_toastFont = nullptr;
 ULONGLONG g_toastStartTick = 0;
 bool g_toastClassRegistered = false;
+wchar_t g_toastClass[64] = {};
+HINSTANCE g_toastInstance = nullptr;
 
 std::wstring Trim(const std::wstring& s) {
     size_t a = 0;
@@ -750,11 +753,9 @@ void WaitForModifierKeysRelease(DWORD timeoutMs = 250) {
     }
 }
 
-constexpr const wchar_t* TOAST_CLASS = L"WindhawkKLTC_Toast";
 constexpr const wchar_t* TOAST_MESSAGE = L"Text converted";
 constexpr UINT_PTR TOAST_TIMER_ID = 1;
 constexpr UINT TOAST_TIMER_MS = 16;
-constexpr ULONGLONG TOAST_FADE_IN_MS = 120;
 constexpr ULONGLONG TOAST_HOLD_MS = 1100;
 constexpr ULONGLONG TOAST_FADE_OUT_MS = 240;
 constexpr BYTE TOAST_MAX_ALPHA = 235;
@@ -818,22 +819,17 @@ LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_TIMER:
             if (wParam == TOAST_TIMER_ID) {
                 ULONGLONG elapsed = GetTickCount64() - g_toastStartTick;
-                ULONGLONG fadeInEnd = TOAST_FADE_IN_MS;
-                ULONGLONG holdEnd = fadeInEnd + TOAST_HOLD_MS;
-                ULONGLONG end = holdEnd + TOAST_FADE_OUT_MS;
-                BYTE alpha;
-                if (elapsed < fadeInEnd) {
-                    alpha = (BYTE)(TOAST_MAX_ALPHA * elapsed / TOAST_FADE_IN_MS);
-                } else if (elapsed < holdEnd) {
-                    alpha = TOAST_MAX_ALPHA;
+                ULONGLONG end = TOAST_HOLD_MS + TOAST_FADE_OUT_MS;
+                if (elapsed < TOAST_HOLD_MS) {
+                    SetLayeredWindowAttributes(hwnd, 0, TOAST_MAX_ALPHA, LWA_ALPHA);
                 } else if (elapsed < end) {
-                    alpha = (BYTE)(TOAST_MAX_ALPHA * (end - elapsed) / TOAST_FADE_OUT_MS);
+                    BYTE alpha = (BYTE)(TOAST_MAX_ALPHA * (end - elapsed) / TOAST_FADE_OUT_MS);
+                    SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
                 } else {
                     KillTimer(hwnd, TOAST_TIMER_ID);
                     DestroyWindow(hwnd);
                     return 0;
                 }
-                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
             }
             return 0;
         case WM_DESTROY:
@@ -858,17 +854,31 @@ void ShowToast() {
     }
 
     if (!g_toastClassRegistered) {
+        HINSTANCE inst = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&ToastWndProc), &inst);
+        if (!inst) {
+            inst = GetModuleHandleW(nullptr);
+        }
+        g_toastInstance = inst;
+
+        // Unique per load, so reloading the mod can never collide with a stale class.
+        _snwprintf_s(g_toastClass, _countof(g_toastClass), _TRUNCATE,
+                     L"WindhawkKLTC_Toast_%llx", (unsigned long long)GetTickCount64());
+
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = ToastWndProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hInstance = inst;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.lpszClassName = TOAST_CLASS;
+        wc.lpszClassName = g_toastClass;
         if (!RegisterClassExW(&wc)) {
             Logf(L"RegisterClassEx(toast) failed: %u", GetLastError());
             return;
         }
         g_toastClassRegistered = true;
+        Logf(L"Toast class registered: %s", g_toastClass);
     }
 
     if (g_toastFont) {
@@ -909,14 +919,14 @@ void ShowToast() {
 
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        TOAST_CLASS, L"", WS_POPUP, x, y, w, h, nullptr, nullptr,
-        GetModuleHandleW(nullptr), nullptr);
+        g_toastClass, L"", WS_POPUP, x, y, w, h, nullptr, nullptr,
+        g_toastInstance, nullptr);
     if (!hwnd) {
         Logf(L"CreateWindowEx(toast) failed: %u", GetLastError());
         return;
     }
     g_toastHwnd = hwnd;
-    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    SetLayeredWindowAttributes(hwnd, 0, TOAST_MAX_ALPHA, LWA_ALPHA);
     HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 14, 14);
     if (rgn && !SetWindowRgn(hwnd, rgn, TRUE)) {
         DeleteObject(rgn);
@@ -925,6 +935,7 @@ void ShowToast() {
     UpdateWindow(hwnd);
     g_toastStartTick = GetTickCount64();
     SetTimer(hwnd, TOAST_TIMER_ID, TOAST_TIMER_MS, nullptr);
+    Logf(L"Toast shown at %d,%d (%dx%d)", x, y, w, h);
 }
 
 void PerformConversion() {
@@ -1211,6 +1222,12 @@ void WhTool_ModUninit() {
         WaitForSingleObject(g_convertThread, 5000);
         CloseHandle(g_convertThread);
         g_convertThread = nullptr;
+    }
+    if (g_toastClassRegistered && g_toastClass[0]) {
+        UnregisterClassW(g_toastClass, g_toastInstance);
+        g_toastClassRegistered = false;
+        g_toastClass[0] = L'\0';
+        g_toastInstance = nullptr;
     }
     if (g_stopEvent) {
         CloseHandle(g_stopEvent);
