@@ -2,7 +2,7 @@
 // @id              keyboard-layout-text-converter
 // @name            Keyboard Layout Text Converter
 // @description     Convert mistyped text in place with a shortcut, adapting to installed keyboard layouts
-// @version         0.3.0
+// @version         0.4.0
 // @author          Windhawk user
 // @homepage        https://windhawk.net/
 // @include         explorer.exe
@@ -28,6 +28,8 @@ Windows applications.
   layout among the keyboard layouts installed on your device, converts the text
   by key positions between layouts, then pastes the converted text back.
 - By default the original clipboard text content is restored after replacement.
+- A small popup showing the converted text appears after each conversion; it can
+  be disabled in the settings.
 
 ## Examples
 - Typed with English layout but meant as another installed layout (and back),
@@ -66,6 +68,9 @@ Windows applications.
 - restoreClipboard: true
   $name: "Restore clipboard"
   $description: "Restore previous clipboard Unicode text after conversion."
+- showNotification: true
+  $name: "Show notification"
+  $description: "Show a small popup with the converted text after a successful conversion."
 - switchLayout: false
   $name: "Switch keyboard layout after convert"
   $description: "Try to switch the active keyboard layout to the detected target layout."
@@ -125,6 +130,7 @@ struct Settings {
     std::wstring scope = L"selection-first";
     bool restoreClipboard = true;
     bool switchLayout = false;
+    bool showNotification = true;
     int actionDelayMs = 40;
 };
 
@@ -161,6 +167,12 @@ bool g_hotkeyPending = false;
 
 std::vector<HKL> g_layouts;
 std::unordered_map<UINT_PTR, LayoutMap> g_layoutMaps;
+
+// Toast notification state (conversion thread only).
+HWND g_toastHwnd = nullptr;
+HFONT g_toastFont = nullptr;
+std::wstring g_toastText;
+bool g_toastClassRegistered = false;
 
 std::wstring Trim(const std::wstring& s) {
     size_t a = 0;
@@ -283,6 +295,7 @@ void LoadSettings() {
 
     s.restoreClipboard = Wh_GetIntSetting(L"restoreClipboard") != 0;
     s.switchLayout = Wh_GetIntSetting(L"switchLayout") != 0;
+    s.showNotification = Wh_GetIntSetting(L"showNotification") != 0;
     s.actionDelayMs = Wh_GetIntSetting(L"actionDelayMs");
     if (s.actionDelayMs <= 0) s.actionDelayMs = 40;
     if (s.actionDelayMs < 10) s.actionDelayMs = 10;
@@ -290,9 +303,10 @@ void LoadSettings() {
 
     s.hotkey = ParseHotkey(s.hotkeyStr);
 
-    Logf(L"Settings: hotkey=%s valid=%d mode=%s scope=%s restoreClipboard=%d switchLayout=%d delay=%d",
+    Logf(L"Settings: hotkey=%s valid=%d mode=%s scope=%s restoreClipboard=%d switchLayout=%d showNotification=%d delay=%d",
          s.hotkeyStr.c_str(), s.hotkey.valid ? 1 : 0, s.mode.c_str(), s.scope.c_str(),
-         s.restoreClipboard ? 1 : 0, s.switchLayout ? 1 : 0, s.actionDelayMs);
+         s.restoreClipboard ? 1 : 0, s.switchLayout ? 1 : 0, s.showNotification ? 1 : 0,
+         s.actionDelayMs);
 
     std::lock_guard<std::mutex> lock(g_settingsMutex);
     g_settings = s;
@@ -736,6 +750,136 @@ void WaitForModifierKeysRelease(DWORD timeoutMs = 250) {
     }
 }
 
+constexpr const wchar_t* TOAST_CLASS = L"WindhawkKLTC_Toast";
+constexpr UINT_PTR TOAST_TIMER_ID = 1;
+constexpr UINT TOAST_DURATION_MS = 1500;
+
+LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            HBRUSH bg = CreateSolidBrush(RGB(28, 28, 30));
+            FillRect(dc, &rc, bg);
+            DeleteObject(bg);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(255, 255, 255));
+            HGDIOBJ oldFont = SelectObject(dc, g_toastFont ? g_toastFont : GetStockObject(DEFAULT_GUI_FONT));
+            DrawTextW(dc, g_toastText.c_str(), -1, &rc,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(dc, oldFont);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+            if (wParam == TOAST_TIMER_ID) {
+                KillTimer(hwnd, TOAST_TIMER_ID);
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        case WM_DESTROY:
+            if (g_toastFont) {
+                DeleteObject(g_toastFont);
+                g_toastFont = nullptr;
+            }
+            if (g_toastHwnd == hwnd) {
+                g_toastHwnd = nullptr;
+            }
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
+// Small click-through popup near the bottom of the foreground window.
+void ShowToast(const std::wstring& text) {
+    if (g_toastHwnd) {
+        DestroyWindow(g_toastHwnd);
+        g_toastHwnd = nullptr;
+    }
+
+    if (!g_toastClassRegistered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = ToastWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = TOAST_CLASS;
+        if (!RegisterClassExW(&wc)) {
+            Logf(L"RegisterClassEx(toast) failed: %u", GetLastError());
+            return;
+        }
+        g_toastClassRegistered = true;
+    }
+
+    g_toastText = text;
+    if (g_toastText.size() > 60) {
+        g_toastText.resize(59);
+        g_toastText += L"\x2026";
+    }
+
+    if (g_toastFont) {
+        DeleteObject(g_toastFont);
+        g_toastFont = nullptr;
+    }
+    g_toastFont = CreateFontW(-16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+    int w = 220;
+    int h = 42;
+    {
+        HDC dc = GetDC(nullptr);
+        HGDIOBJ oldFont = SelectObject(dc, g_toastFont);
+        SIZE sz = {};
+        if (GetTextExtentPoint32W(dc, g_toastText.c_str(), (int)g_toastText.size(), &sz)) {
+            w = (std::min)(520, (int)sz.cx + 40);
+            h = (int)sz.cy + 22;
+        }
+        SelectObject(dc, oldFont);
+        ReleaseDC(nullptr, dc);
+    }
+
+    HWND fg = GetForegroundWindow();
+    if (!fg) fg = GetDesktopWindow();
+    RECT target = {};
+    GetWindowRect(fg, &target);
+
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    GetMonitorInfoW(mon, &mi);
+
+    int x = target.left + (target.right - target.left - w) / 2;
+    int y = target.bottom - h - 64;
+    if (x < mi.rcWork.left + 8) x = mi.rcWork.left + 8;
+    if (x + w > mi.rcWork.right - 8) x = mi.rcWork.right - 8 - w;
+    if (y < mi.rcWork.top + 8) y = mi.rcWork.top + 8;
+    if (y + h > mi.rcWork.bottom - 8) y = mi.rcWork.bottom - 8 - h;
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        TOAST_CLASS, L"", WS_POPUP, x, y, w, h, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        Logf(L"CreateWindowEx(toast) failed: %u", GetLastError());
+        return;
+    }
+    g_toastHwnd = hwnd;
+    SetLayeredWindowAttributes(hwnd, 0, 235, LWA_ALPHA);
+    HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 12, 12);
+    if (rgn && !SetWindowRgn(hwnd, rgn, TRUE)) {
+        DeleteObject(rgn);
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(hwnd);
+    SetTimer(hwnd, TOAST_TIMER_ID, TOAST_DURATION_MS, nullptr);
+}
+
 void PerformConversion() {
     std::lock_guard<std::mutex> opLock(g_convertMutex);
     ULONGLONG tStart = GetTickCount64();
@@ -810,6 +954,10 @@ void PerformConversion() {
 
     SendKeyCombo('V', true, false, false, false); // Ctrl+V
     ULONGLONG tPasteDone = GetTickCount64();
+
+    if (s.showNotification) {
+        ShowToast(converted);
+    }
 
     Sleep(s.restoreClipboard ? 150 : 40);
 
@@ -950,6 +1098,10 @@ DWORD WINAPI ConversionThreadProc(LPVOID) {
     }
 
 done:
+    if (g_toastHwnd) {
+        DestroyWindow(g_toastHwnd);
+        g_toastHwnd = nullptr;
+    }
     g_convertThreadId = 0;
     return 0;
 }
