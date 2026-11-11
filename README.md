@@ -10,7 +10,7 @@ Select the mistyped text and press **Left Ctrl + Left Shift**. The mod copies th
 - Detects the most plausible source/target layout among the installed layouts, or cycles through them.
 - Supports Latin, Cyrillic, Hebrew, Arabic, and Greek layouts for conversion scoring.
 - Optional clipboard restore and optional keyboard-layout switch after conversion.
-- Optional small popup showing the converted text.
+- Optional small success toast in the screen corner.
 - Runs inside `explorer.exe` as a Windhawk tool mod.
 
 ## Install
@@ -31,7 +31,7 @@ Select the mistyped text and press **Left Ctrl + Left Shift**. The mod copies th
 - **Conversion mode** — auto-detect layouts or cycle through installed layouts.
 - **Capture scope** — selection with previous-word fallback, selection only, or previous word only.
 - **Restore clipboard** — restore the previous clipboard text after conversion.
-- **Show notification** — show a small popup with the converted text after conversion.
+- **Show notification** — show a small success toast in the screen corner after conversion.
 - **Switch keyboard layout after convert** — switch to the detected target layout.
 - **Clipboard timeout (ms)** — base timeout for clipboard copy/paste handshakes; raise it for slow applications.
 

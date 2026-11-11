@@ -2,9 +2,9 @@
 // @id              keyboard-layout-text-converter
 // @name            Keyboard Layout Text Converter
 // @description     Convert mistyped text in place with a shortcut, adapting to installed keyboard layouts
-// @version         0.4.0
-// @author          Windhawk user
-// @homepage        https://windhawk.net/
+// @version         0.5.0
+// @author          OMAR ALAFA
+// @homepage        https://github.com/omar-devloop/keyboard-layout-text-converter
 // @include         explorer.exe
 // @compilerOptions -luser32 -lkernel32 -lshell32 -lgdi32
 // @architecture    x86-64
@@ -28,8 +28,8 @@ Windows applications.
   layout among the keyboard layouts installed on your device, converts the text
   by key positions between layouts, then pastes the converted text back.
 - By default the original clipboard text content is restored after replacement.
-- A small popup showing the converted text appears after each conversion; it can
-  be disabled in the settings.
+- A small success toast appears in the bottom-right screen corner after each
+  conversion; it can be disabled in the settings.
 
 ## Examples
 - Typed with English layout but meant as another installed layout (and back),
@@ -70,7 +70,7 @@ Windows applications.
   $description: "Restore previous clipboard Unicode text after conversion."
 - showNotification: true
   $name: "Show notification"
-  $description: "Show a small popup with the converted text after a successful conversion."
+  $description: "Show a small success toast in the screen corner after a successful conversion."
 - switchLayout: false
   $name: "Switch keyboard layout after convert"
   $description: "Try to switch the active keyboard layout to the detected target layout."
@@ -171,7 +171,7 @@ std::unordered_map<UINT_PTR, LayoutMap> g_layoutMaps;
 // Toast notification state (conversion thread only).
 HWND g_toastHwnd = nullptr;
 HFONT g_toastFont = nullptr;
-std::wstring g_toastText;
+ULONGLONG g_toastStartTick = 0;
 bool g_toastClassRegistered = false;
 
 std::wstring Trim(const std::wstring& s) {
@@ -751,8 +751,13 @@ void WaitForModifierKeysRelease(DWORD timeoutMs = 250) {
 }
 
 constexpr const wchar_t* TOAST_CLASS = L"WindhawkKLTC_Toast";
+constexpr const wchar_t* TOAST_MESSAGE = L"Text converted";
 constexpr UINT_PTR TOAST_TIMER_ID = 1;
-constexpr UINT TOAST_DURATION_MS = 1500;
+constexpr UINT TOAST_TIMER_MS = 16;
+constexpr ULONGLONG TOAST_FADE_IN_MS = 120;
+constexpr ULONGLONG TOAST_HOLD_MS = 1100;
+constexpr ULONGLONG TOAST_FADE_OUT_MS = 240;
+constexpr BYTE TOAST_MAX_ALPHA = 235;
 
 LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -763,22 +768,72 @@ LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             HDC dc = BeginPaint(hwnd, &ps);
             RECT rc;
             GetClientRect(hwnd, &rc);
-            HBRUSH bg = CreateSolidBrush(RGB(28, 28, 30));
-            FillRect(dc, &rc, bg);
-            DeleteObject(bg);
+            const int w = rc.right;
+            const int h = rc.bottom;
+            const int saved = SaveDC(dc);
+
+            // Card background with a subtle border (shadcn-like dark toast).
+            HBRUSH bg = CreateSolidBrush(RGB(24, 24, 27));        // zinc-900
+            HPEN border = CreatePen(PS_SOLID, 1, RGB(63, 63, 70)); // zinc-700
+            SelectObject(dc, bg);
+            SelectObject(dc, border);
+            RoundRect(dc, 0, 0, w, h, 14, 14);
+
+            // Success badge: green circle with a white check mark.
+            const int cx = 24;
+            const int cy = h / 2;
+            const int r = 9;
+            HBRUSH badge = CreateSolidBrush(RGB(34, 197, 94)); // green-500
+            HPEN badgePen = CreatePen(PS_SOLID, 1, RGB(34, 197, 94));
+            SelectObject(dc, badge);
+            SelectObject(dc, badgePen);
+            Ellipse(dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+
+            HPEN checkPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+            SelectObject(dc, checkPen);
+            POINT check[3] = {
+                {cx - 4, cy},
+                {cx - 1, cy + 3},
+                {cx + 5, cy - 4},
+            };
+            Polyline(dc, check, 3);
+
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, RGB(255, 255, 255));
-            HGDIOBJ oldFont = SelectObject(dc, g_toastFont ? g_toastFont : GetStockObject(DEFAULT_GUI_FONT));
-            DrawTextW(dc, g_toastText.c_str(), -1, &rc,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            SelectObject(dc, oldFont);
+            SetTextColor(dc, RGB(250, 250, 250)); // zinc-50
+            SelectObject(dc, g_toastFont ? g_toastFont : GetStockObject(DEFAULT_GUI_FONT));
+            RECT textRc = {cx + r + 10, 0, w - 16, h};
+            DrawTextW(dc, TOAST_MESSAGE, -1, &textRc,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+            RestoreDC(dc, saved);
+            DeleteObject(checkPen);
+            DeleteObject(badgePen);
+            DeleteObject(badge);
+            DeleteObject(border);
+            DeleteObject(bg);
+
             EndPaint(hwnd, &ps);
             return 0;
         }
         case WM_TIMER:
             if (wParam == TOAST_TIMER_ID) {
-                KillTimer(hwnd, TOAST_TIMER_ID);
-                DestroyWindow(hwnd);
+                ULONGLONG elapsed = GetTickCount64() - g_toastStartTick;
+                ULONGLONG fadeInEnd = TOAST_FADE_IN_MS;
+                ULONGLONG holdEnd = fadeInEnd + TOAST_HOLD_MS;
+                ULONGLONG end = holdEnd + TOAST_FADE_OUT_MS;
+                BYTE alpha;
+                if (elapsed < fadeInEnd) {
+                    alpha = (BYTE)(TOAST_MAX_ALPHA * elapsed / TOAST_FADE_IN_MS);
+                } else if (elapsed < holdEnd) {
+                    alpha = TOAST_MAX_ALPHA;
+                } else if (elapsed < end) {
+                    alpha = (BYTE)(TOAST_MAX_ALPHA * (end - elapsed) / TOAST_FADE_OUT_MS);
+                } else {
+                    KillTimer(hwnd, TOAST_TIMER_ID);
+                    DestroyWindow(hwnd);
+                    return 0;
+                }
+                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
             }
             return 0;
         case WM_DESTROY:
@@ -795,8 +850,8 @@ LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 }
 
-// Small click-through popup near the bottom of the foreground window.
-void ShowToast(const std::wstring& text) {
+// Fixed corner success toast, independent of the active window.
+void ShowToast() {
     if (g_toastHwnd) {
         DestroyWindow(g_toastHwnd);
         g_toastHwnd = nullptr;
@@ -816,50 +871,41 @@ void ShowToast(const std::wstring& text) {
         g_toastClassRegistered = true;
     }
 
-    g_toastText = text;
-    if (g_toastText.size() > 60) {
-        g_toastText.resize(59);
-        g_toastText += L"\x2026";
-    }
-
     if (g_toastFont) {
         DeleteObject(g_toastFont);
         g_toastFont = nullptr;
     }
-    g_toastFont = CreateFontW(-16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    g_toastFont = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
+    const int textLeft = 24 + 9 + 10;
+    const int h = 46;
     int w = 220;
-    int h = 42;
     {
         HDC dc = GetDC(nullptr);
         HGDIOBJ oldFont = SelectObject(dc, g_toastFont);
         SIZE sz = {};
-        if (GetTextExtentPoint32W(dc, g_toastText.c_str(), (int)g_toastText.size(), &sz)) {
-            w = (std::min)(520, (int)sz.cx + 40);
-            h = (int)sz.cy + 22;
+        if (GetTextExtentPoint32W(dc, TOAST_MESSAGE, (int)wcslen(TOAST_MESSAGE), &sz)) {
+            w = textLeft + (int)sz.cx + 18;
         }
         SelectObject(dc, oldFont);
         ReleaseDC(nullptr, dc);
     }
 
-    HWND fg = GetForegroundWindow();
-    if (!fg) fg = GetDesktopWindow();
-    RECT target = {};
-    GetWindowRect(fg, &target);
-
+    // Bottom-right corner of the monitor under the cursor.
+    POINT cursor = {};
+    GetCursorPos(&cursor);
     MONITORINFO mi = {};
     mi.cbSize = sizeof(mi);
-    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     GetMonitorInfoW(mon, &mi);
 
-    int x = target.left + (target.right - target.left - w) / 2;
-    int y = target.bottom - h - 64;
-    if (x < mi.rcWork.left + 8) x = mi.rcWork.left + 8;
-    if (x + w > mi.rcWork.right - 8) x = mi.rcWork.right - 8 - w;
-    if (y < mi.rcWork.top + 8) y = mi.rcWork.top + 8;
-    if (y + h > mi.rcWork.bottom - 8) y = mi.rcWork.bottom - 8 - h;
+    const int margin = 24;
+    int x = mi.rcWork.right - w - margin;
+    int y = mi.rcWork.bottom - h - margin;
+    if (x < mi.rcWork.left + margin) x = mi.rcWork.left + margin;
+    if (y < mi.rcWork.top + margin) y = mi.rcWork.top + margin;
 
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -870,14 +916,15 @@ void ShowToast(const std::wstring& text) {
         return;
     }
     g_toastHwnd = hwnd;
-    SetLayeredWindowAttributes(hwnd, 0, 235, LWA_ALPHA);
-    HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 12, 12);
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 14, 14);
     if (rgn && !SetWindowRgn(hwnd, rgn, TRUE)) {
         DeleteObject(rgn);
     }
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
-    SetTimer(hwnd, TOAST_TIMER_ID, TOAST_DURATION_MS, nullptr);
+    g_toastStartTick = GetTickCount64();
+    SetTimer(hwnd, TOAST_TIMER_ID, TOAST_TIMER_MS, nullptr);
 }
 
 void PerformConversion() {
@@ -956,7 +1003,7 @@ void PerformConversion() {
     ULONGLONG tPasteDone = GetTickCount64();
 
     if (s.showNotification) {
-        ShowToast(converted);
+        ShowToast();
     }
 
     Sleep(s.restoreClipboard ? 150 : 40);
