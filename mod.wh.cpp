@@ -938,6 +938,15 @@ void ShowToast() {
     Logf(L"Toast shown at %d,%d (%dx%d)", x, y, w, h);
 }
 
+// Backstop so the toast can never get stuck if timer messages are missed.
+void ExpireToastIfNeeded() {
+    if (g_toastHwnd &&
+        GetTickCount64() - g_toastStartTick >= TOAST_HOLD_MS + TOAST_FADE_OUT_MS) {
+        DestroyWindow(g_toastHwnd);
+        g_toastHwnd = nullptr;
+    }
+}
+
 void PerformConversion() {
     std::lock_guard<std::mutex> opLock(g_convertMutex);
     ULONGLONG tStart = GetTickCount64();
@@ -1138,9 +1147,14 @@ DWORD WINAPI ConversionThreadProc(LPVOID) {
     Logf(L"Conversion thread started (thread=%lu)", GetCurrentThreadId());
 
     for (;;) {
-        DWORD wait = MsgWaitForMultipleObjects(1, &g_stopEvent, FALSE, INFINITE, QS_ALLINPUT);
+        DWORD wait = MsgWaitForMultipleObjects(1, &g_stopEvent, FALSE,
+                                               g_toastHwnd ? 100 : INFINITE, QS_ALLINPUT);
         if (wait == WAIT_OBJECT_0) {
             break;
+        }
+        if (wait == WAIT_TIMEOUT) {
+            ExpireToastIfNeeded();
+            continue;
         }
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
