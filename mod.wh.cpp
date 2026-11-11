@@ -6,7 +6,7 @@
 // @author          Windhawk user
 // @homepage        https://windhawk.net/
 // @include         explorer.exe
-// @compilerOptions -luser32 -lkernel32 -lshell32
+// @compilerOptions -luser32 -lkernel32 -lshell32 -lgdi32
 // @architecture    x86-64
 // ==/WindhawkMod==
 
