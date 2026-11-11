@@ -2,11 +2,11 @@
 // @id              keyboard-layout-text-converter
 // @name            Keyboard Layout Text Converter
 // @description     Convert mistyped text in place with a shortcut, adapting to installed keyboard layouts
-// @version         0.5.0
+// @version         0.6.0
 // @author          OMAR ALAFA
 // @homepage        https://github.com/omar-devloop/keyboard-layout-text-converter
 // @include         explorer.exe
-// @compilerOptions -luser32 -lkernel32 -lshell32 -lgdi32
+// @compilerOptions -luser32 -lkernel32 -lshell32 -lgdi32 -lgdiplus
 // @architecture    x86-64
 // ==/WindhawkMod==
 
@@ -80,8 +80,13 @@ Windows applications.
 */
 // ==/WindhawkModSettings==
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
 #include <shellapi.h>
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <cctype>
@@ -171,11 +176,23 @@ std::unordered_map<UINT_PTR, LayoutMap> g_layoutMaps;
 
 // Toast notification state (conversion thread only).
 HWND g_toastHwnd = nullptr;
-HFONT g_toastFont = nullptr;
 ULONGLONG g_toastStartTick = 0;
 bool g_toastClassRegistered = false;
 wchar_t g_toastClass[64] = {};
 HINSTANCE g_toastInstance = nullptr;
+HDC g_toastMemDC = nullptr;
+HBITMAP g_toastDib = nullptr;
+HGDIOBJ g_toastOldDib = nullptr;
+void* g_toastBits = nullptr;
+BYTE g_toastAlpha = 255;
+int g_toastPad = 0;
+int g_toastCardW = 0;
+int g_toastCardH = 0;
+RECT g_toastCloseRect = {};
+
+// GDI+ lifetime.
+ULONG_PTR g_gdiplusToken = 0;
+bool g_gdiplusReady = false;
 
 std::wstring Trim(const std::wstring& s) {
     size_t a = 0;
@@ -758,7 +775,185 @@ constexpr UINT_PTR TOAST_TIMER_ID = 1;
 constexpr UINT TOAST_TIMER_MS = 16;
 constexpr ULONGLONG TOAST_HOLD_MS = 1100;
 constexpr ULONGLONG TOAST_FADE_OUT_MS = 240;
-constexpr BYTE TOAST_MAX_ALPHA = 235;
+
+struct ToastLayout {
+    float scale = 1.0f;
+    int width = 0;
+    int height = 0;
+    int pad = 0;
+    int cardW = 0;
+    int cardH = 0;
+    int iconRadius = 0;
+    int iconCx = 0;
+    int iconCy = 0;
+    int textLeft = 0;
+    int textWidth = 0;
+    int closeCx = 0;
+    int closeCy = 0;
+    int closeHalf = 0;
+};
+
+int ToastPx(int value, float scale) {
+    return (int)(value * scale + 0.5f);
+}
+
+void AddRoundedRect(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rect, float radius) {
+    float d = radius * 2.0f;
+    if (d > rect.Width) d = rect.Width;
+    if (d > rect.Height) d = rect.Height;
+    if (d <= 0.0f) {
+        path.AddRectangle(rect);
+        return;
+    }
+    path.AddArc(rect.X, rect.Y, d, d, 180.0f, 90.0f);
+    path.AddArc(rect.GetRight() - d, rect.Y, d, d, 270.0f, 90.0f);
+    path.AddArc(rect.GetRight() - d, rect.GetBottom() - d, d, d, 0.0f, 90.0f);
+    path.AddArc(rect.X, rect.GetBottom() - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure();
+}
+
+// Paints the toast into a 32bpp premultiplied-alpha bitmap:
+// white pill card, thin #e5e7eb border, soft rgba(0,0,0,0.05) shadow,
+// black circular check badge (#111827), #4b5563 text and a #6b7280 close icon.
+void RenderToast(Gdiplus::Bitmap& bitmap, const ToastLayout& layout) {
+    Gdiplus::Graphics g(&bitmap);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+    g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    g.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+    const float pad = (float)layout.pad;
+    const Gdiplus::RectF card(pad, pad, (float)layout.cardW, (float)layout.cardH);
+    const float radius = card.Height / 2.0f;  // pill shape
+
+    // Soft shadow: stacked low-alpha rounded layers approximating rgba(0,0,0,0.05).
+    for (int i = 8; i >= 1; --i) {
+        Gdiplus::RectF shadow(card.X - i, card.Y - i + 2.0f * layout.scale,
+                              card.Width + i * 2.0f, card.Height + i * 2.0f);
+        Gdiplus::GraphicsPath shadowPath;
+        AddRoundedRect(shadowPath, shadow, radius + i);
+        Gdiplus::SolidBrush shadowBrush(Gdiplus::Color(2, 0, 0, 0));
+        g.FillPath(&shadowBrush, &shadowPath);
+    }
+
+    // White card with a thin neutral border.
+    Gdiplus::RectF borderRect(card.X + 0.5f, card.Y + 0.5f, card.Width - 1.0f,
+                              card.Height - 1.0f);
+    Gdiplus::GraphicsPath cardPath;
+    AddRoundedRect(cardPath, borderRect, radius - 0.5f);
+    Gdiplus::SolidBrush cardBrush(Gdiplus::Color(255, 255, 255, 255));
+    g.FillPath(&cardBrush, &cardPath);
+    Gdiplus::Pen borderPen(Gdiplus::Color(255, 229, 231, 235), 1.0f);
+    g.DrawPath(&borderPen, &cardPath);
+
+    // Black circular success badge with a white check mark.
+    const float iconR = (float)layout.iconRadius;
+    const float iconCx = (float)layout.iconCx;
+    const float iconCy = (float)layout.iconCy;
+    Gdiplus::SolidBrush iconBrush(Gdiplus::Color(255, 17, 24, 39));  // #111827
+    g.FillEllipse(&iconBrush, iconCx - iconR, iconCy - iconR, iconR * 2.0f, iconR * 2.0f);
+
+    Gdiplus::Pen checkPen(Gdiplus::Color(255, 255, 255, 255),
+                          2.0f * layout.scale > 1.0f ? 2.0f * layout.scale : 1.0f);
+    checkPen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound, Gdiplus::DashCapRound);
+    checkPen.SetLineJoin(Gdiplus::LineJoinRound);
+    Gdiplus::PointF check[3] = {
+        Gdiplus::PointF(iconCx - iconR * 0.46f, iconCy + iconR * 0.02f),
+        Gdiplus::PointF(iconCx - iconR * 0.14f, iconCy + iconR * 0.36f),
+        Gdiplus::PointF(iconCx + iconR * 0.48f, iconCy - iconR * 0.36f),
+    };
+    g.DrawLines(&checkPen, check, 3);
+
+    // Body text (#4b5563).
+    Gdiplus::Font font(L"Segoe UI", 14.0f * layout.scale, Gdiplus::FontStyleRegular,
+                       Gdiplus::UnitPixel);
+    Gdiplus::SolidBrush textBrush(Gdiplus::Color(255, 75, 85, 99));  // #4b5563
+    Gdiplus::StringFormat textFormat;
+    textFormat.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    textFormat.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    textFormat.SetAlignment(Gdiplus::StringAlignmentNear);
+    textFormat.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    Gdiplus::RectF textRect((float)layout.textLeft, pad, (float)layout.textWidth,
+                            (float)layout.cardH);
+    g.DrawString(TOAST_MESSAGE, -1, &font, textRect, &textFormat, &textBrush);
+
+    // Close icon (#6b7280).
+    const float closeCx = (float)layout.closeCx;
+    const float closeCy = (float)layout.closeCy;
+    const float closeHalf = (float)layout.closeHalf;
+    Gdiplus::Pen closePen(Gdiplus::Color(255, 107, 114, 128),
+                          1.5f * layout.scale > 1.0f ? 1.5f * layout.scale : 1.0f);
+    closePen.SetLineCap(Gdiplus::LineCapRound, Gdiplus::LineCapRound, Gdiplus::DashCapRound);
+    g.DrawLine(&closePen, closeCx - closeHalf, closeCy - closeHalf, closeCx + closeHalf,
+               closeCy + closeHalf);
+    g.DrawLine(&closePen, closeCx + closeHalf, closeCy - closeHalf, closeCx - closeHalf,
+               closeCy + closeHalf);
+}
+
+void DestroyToastResources() {    if (g_toastMemDC) {
+        if (g_toastOldDib) {
+            SelectObject(g_toastMemDC, g_toastOldDib);
+            g_toastOldDib = nullptr;
+        }
+        DeleteDC(g_toastMemDC);
+        g_toastMemDC = nullptr;
+    }
+    if (g_toastDib) {
+        DeleteObject(g_toastDib);
+        g_toastDib = nullptr;
+    }
+    g_toastBits = nullptr;
+    g_toastAlpha = 255;
+}
+
+void StopGdiplus() {
+    if (g_gdiplusReady) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+        g_gdiplusReady = false;
+    }
+}
+
+bool PointInToastCard(POINT pt) {
+    if (g_toastCardW <= 0 || g_toastCardH <= 0) return false;
+    const int left = g_toastPad;
+    const int top = g_toastPad;
+    const int right = left + g_toastCardW;
+    const int bottom = top + g_toastCardH;
+    if (pt.x < left || pt.x >= right || pt.y < top || pt.y >= bottom) return false;
+
+    const int radius = g_toastCardH / 2;
+    int cx = -1;
+    int cy = -1;
+    if (pt.x < left + radius) {
+        cx = left + radius;
+    } else if (pt.x >= right - radius) {
+        cx = right - radius - 1;
+    }
+    if (pt.y < top + radius) {
+        cy = top + radius;
+    } else if (pt.y >= bottom - radius) {
+        cy = bottom - radius - 1;
+    }
+    if (cx < 0 || cy < 0) return true;
+
+    const int dx = pt.x - cx;
+    const int dy = pt.y - cy;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+void UpdateToastAlpha(HWND hwnd, BYTE alpha) {
+    if (!g_toastMemDC) return;
+    RECT rc = {};
+    if (!GetWindowRect(hwnd, &rc)) return;
+    POINT dst = {rc.left, rc.top};
+    SIZE size = {rc.right - rc.left, rc.bottom - rc.top};
+    POINT src = {0, 0};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    UpdateLayeredWindow(hwnd, nullptr, &dst, &size, g_toastMemDC, &src, 0, &blend, ULW_ALPHA);
+}
 
 LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -766,77 +961,51 @@ LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
-            HDC dc = BeginPaint(hwnd, &ps);
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            const int w = rc.right;
-            const int h = rc.bottom;
-            const int saved = SaveDC(dc);
-
-            // Card background with a subtle border (shadcn-like dark toast).
-            HBRUSH bg = CreateSolidBrush(RGB(24, 24, 27));        // zinc-900
-            HPEN border = CreatePen(PS_SOLID, 1, RGB(63, 63, 70)); // zinc-700
-            SelectObject(dc, bg);
-            SelectObject(dc, border);
-            RoundRect(dc, 0, 0, w, h, 14, 14);
-
-            // Success badge: green circle with a white check mark.
-            const int cx = 24;
-            const int cy = h / 2;
-            const int r = 9;
-            HBRUSH badge = CreateSolidBrush(RGB(34, 197, 94)); // green-500
-            HPEN badgePen = CreatePen(PS_SOLID, 1, RGB(34, 197, 94));
-            SelectObject(dc, badge);
-            SelectObject(dc, badgePen);
-            Ellipse(dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
-
-            HPEN checkPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-            SelectObject(dc, checkPen);
-            POINT check[3] = {
-                {cx - 4, cy},
-                {cx - 1, cy + 3},
-                {cx + 5, cy - 4},
-            };
-            Polyline(dc, check, 3);
-
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, RGB(250, 250, 250)); // zinc-50
-            SelectObject(dc, g_toastFont ? g_toastFont : GetStockObject(DEFAULT_GUI_FONT));
-            RECT textRc = {cx + r + 10, 0, w - 16, h};
-            DrawTextW(dc, TOAST_MESSAGE, -1, &textRc,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-            RestoreDC(dc, saved);
-            DeleteObject(checkPen);
-            DeleteObject(badgePen);
-            DeleteObject(badge);
-            DeleteObject(border);
-            DeleteObject(bg);
-
+            BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
             return 0;
         }
+        case WM_NCHITTEST: {
+            POINT pt = {(short)LOWORD(lParam), (short)HIWORD(lParam)};
+            ScreenToClient(hwnd, &pt);
+            // Only the visible card is clickable; the shadow area is click-through.
+            return PointInToastCard(pt) ? HTCLIENT : HTTRANSPARENT;
+        }
+        case WM_SETCURSOR: {
+            POINT pt = {};
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            bool overClose = pt.x >= g_toastCloseRect.left && pt.x < g_toastCloseRect.right &&
+                             pt.y >= g_toastCloseRect.top && pt.y < g_toastCloseRect.bottom;
+            SetCursor(LoadCursorW(nullptr, overClose ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+            DestroyWindow(hwnd);
+            return 0;
         case WM_TIMER:
             if (wParam == TOAST_TIMER_ID) {
-                ULONGLONG elapsed = GetTickCount64() - g_toastStartTick;
-                ULONGLONG end = TOAST_HOLD_MS + TOAST_FADE_OUT_MS;
+                const ULONGLONG elapsed = GetTickCount64() - g_toastStartTick;
+                const ULONGLONG end = TOAST_HOLD_MS + TOAST_FADE_OUT_MS;
+                BYTE alpha;
                 if (elapsed < TOAST_HOLD_MS) {
-                    SetLayeredWindowAttributes(hwnd, 0, TOAST_MAX_ALPHA, LWA_ALPHA);
+                    alpha = 255;
                 } else if (elapsed < end) {
-                    BYTE alpha = (BYTE)(TOAST_MAX_ALPHA * (end - elapsed) / TOAST_FADE_OUT_MS);
-                    SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+                    alpha = (BYTE)(255 * (end - elapsed) / TOAST_FADE_OUT_MS);
                 } else {
                     KillTimer(hwnd, TOAST_TIMER_ID);
                     DestroyWindow(hwnd);
                     return 0;
                 }
+                if (alpha != g_toastAlpha) {
+                    g_toastAlpha = alpha;
+                    UpdateToastAlpha(hwnd, alpha);
+                }
             }
             return 0;
         case WM_DESTROY:
-            if (g_toastFont) {
-                DeleteObject(g_toastFont);
-                g_toastFont = nullptr;
-            }
+            DestroyToastResources();
             if (g_toastHwnd == hwnd) {
                 g_toastHwnd = nullptr;
             }
@@ -848,6 +1017,11 @@ LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 // Fixed corner success toast, independent of the active window.
 void ShowToast() {
+    if (!g_gdiplusReady) {
+        Logf(L"Toast skipped: GDI+ is not initialized");
+        return;
+    }
+
     if (g_toastHwnd) {
         DestroyWindow(g_toastHwnd);
         g_toastHwnd = nullptr;
@@ -881,27 +1055,58 @@ void ShowToast() {
         Logf(L"Toast class registered: %s", g_toastClass);
     }
 
-    if (g_toastFont) {
-        DeleteObject(g_toastFont);
-        g_toastFont = nullptr;
-    }
-    g_toastFont = CreateFontW(-15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-
-    const int textLeft = 24 + 9 + 10;
-    const int h = 46;
-    int w = 220;
+    float scale = 1.0f;
     {
-        HDC dc = GetDC(nullptr);
-        HGDIOBJ oldFont = SelectObject(dc, g_toastFont);
-        SIZE sz = {};
-        if (GetTextExtentPoint32W(dc, TOAST_MESSAGE, (int)wcslen(TOAST_MESSAGE), &sz)) {
-            w = textLeft + (int)sz.cx + 18;
+        UINT dpi = GetDpiForSystem();
+        if (dpi >= 48) {
+            scale = (float)dpi / 96.0f;
         }
-        SelectObject(dc, oldFont);
-        ReleaseDC(nullptr, dc);
     }
+
+    // Measure the body text with the exact font used for rendering.
+    float measuredText = 0.0f;
+    {
+        Gdiplus::Font font(L"Segoe UI", 14.0f * scale, Gdiplus::FontStyleRegular,
+                           Gdiplus::UnitPixel);
+        HDC screenDC = GetDC(nullptr);
+        if (screenDC) {
+            {
+                Gdiplus::Graphics measure(screenDC);
+                measure.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+                Gdiplus::RectF bounds;
+                measure.MeasureString(TOAST_MESSAGE, -1, &font, Gdiplus::PointF(0.0f, 0.0f),
+                                      &bounds);
+                measuredText = bounds.Width;
+            }
+            ReleaseDC(nullptr, screenDC);
+        }
+    }
+
+    ToastLayout layout;
+    layout.scale = scale;
+    layout.pad = ToastPx(12, scale);
+    layout.cardH = ToastPx(48, scale);
+    layout.iconRadius = ToastPx(9, scale);
+
+    const int leftInset = ToastPx(15, scale);
+    const int iconGap = ToastPx(12, scale);
+    const int closeGap = ToastPx(12, scale);
+    const int closeSize = ToastPx(10, scale);
+    const int rightInset = ToastPx(16, scale);
+
+    layout.cardW = leftInset + layout.iconRadius * 2 + iconGap + (int)(measuredText + 0.5f) +
+                   closeGap + closeSize + rightInset;
+    layout.width = layout.cardW + layout.pad * 2;
+    layout.height = layout.cardH + layout.pad * 2;
+
+    layout.iconCx = layout.pad + leftInset + layout.iconRadius;
+    layout.iconCy = layout.pad + layout.cardH / 2;
+    layout.textLeft = layout.iconCx + layout.iconRadius + iconGap;
+    layout.textWidth = layout.pad + layout.cardW - rightInset - closeSize - closeGap -
+                       layout.textLeft;
+    layout.closeCx = layout.pad + layout.cardW - rightInset - closeSize / 2;
+    layout.closeCy = layout.iconCy;
+    layout.closeHalf = closeSize / 2;
 
     // Bottom-right corner of the monitor under the cursor.
     POINT cursor = {};
@@ -911,31 +1116,86 @@ void ShowToast() {
     HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     GetMonitorInfoW(mon, &mi);
 
-    const int margin = 24;
-    int x = mi.rcWork.right - w - margin;
-    int y = mi.rcWork.bottom - h - margin;
+    const int margin = ToastPx(12, scale);
+    int x = mi.rcWork.right - layout.width - margin;
+    int y = mi.rcWork.bottom - layout.height - margin;
     if (x < mi.rcWork.left + margin) x = mi.rcWork.left + margin;
     if (y < mi.rcWork.top + margin) y = mi.rcWork.top + margin;
 
-    HWND hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        g_toastClass, L"", WS_POPUP, x, y, w, h, nullptr, nullptr,
-        g_toastInstance, nullptr);
-    if (!hwnd) {
-        Logf(L"CreateWindowEx(toast) failed: %u", GetLastError());
+    // Offscreen 32bpp surface for per-pixel alpha (UpdateLayeredWindow).
+    HDC screenDC = GetDC(nullptr);
+    if (!screenDC) {
+        Logf(L"Toast: GetDC failed");
         return;
     }
-    g_toastHwnd = hwnd;
-    SetLayeredWindowAttributes(hwnd, 0, TOAST_MAX_ALPHA, LWA_ALPHA);
-    HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 14, 14);
-    if (rgn && !SetWindowRgn(hwnd, rgn, TRUE)) {
-        DeleteObject(rgn);
+    g_toastMemDC = CreateCompatibleDC(screenDC);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = layout.width;
+    bmi.bmiHeader.biHeight = -layout.height;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    g_toastDib = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, &g_toastBits, nullptr, 0);
+    ReleaseDC(nullptr, screenDC);
+    if (!g_toastMemDC || !g_toastDib || !g_toastBits) {
+        Logf(L"Toast DIB creation failed: %u", GetLastError());
+        DestroyToastResources();
+        return;
     }
+    g_toastOldDib = SelectObject(g_toastMemDC, g_toastDib);
+    if (!g_toastOldDib) {
+        Logf(L"Toast SelectObject failed: %u", GetLastError());
+        DestroyToastResources();
+        return;
+    }
+
+    {
+        Gdiplus::Bitmap bitmap(layout.width, layout.height, layout.width * 4,
+                               PixelFormat32bppPARGB, (BYTE*)g_toastBits);
+        if (bitmap.GetLastStatus() != Gdiplus::Ok) {
+            Logf(L"Toast bitmap creation failed");
+            DestroyToastResources();
+            return;
+        }
+        RenderToast(bitmap, layout);
+    }
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, g_toastClass, L"",
+        WS_POPUP, x, y, layout.width, layout.height, nullptr, nullptr, g_toastInstance,
+        nullptr);
+    if (!hwnd) {
+        Logf(L"CreateWindowEx(toast) failed: %u", GetLastError());
+        DestroyToastResources();
+        return;
+    }
+
+    POINT dst = {x, y};
+    SIZE size = {layout.width, layout.height};
+    POINT src = {0, 0};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    if (!UpdateLayeredWindow(hwnd, nullptr, &dst, &size, g_toastMemDC, &src, 0, &blend,
+                             ULW_ALPHA)) {
+        Logf(L"UpdateLayeredWindow failed: %u", GetLastError());
+    }
+
+    g_toastHwnd = hwnd;
+    g_toastAlpha = 255;
+    g_toastPad = layout.pad;
+    g_toastCardW = layout.cardW;
+    g_toastCardH = layout.cardH;
+    const int closeHitPad = ToastPx(6, scale);
+    g_toastCloseRect = {layout.closeCx - layout.closeHalf - closeHitPad,
+                        layout.closeCy - layout.closeHalf - closeHitPad,
+                        layout.closeCx + layout.closeHalf + closeHitPad,
+                        layout.closeCy + layout.closeHalf + closeHitPad};
+
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
     g_toastStartTick = GetTickCount64();
     SetTimer(hwnd, TOAST_TIMER_ID, TOAST_TIMER_MS, nullptr);
-    Logf(L"Toast shown at %d,%d (%dx%d)", x, y, w, h);
+    Logf(L"Toast shown at %d,%d (%dx%d)", x, y, layout.width, layout.height);
 }
 
 // Backstop so the toast can never get stuck if timer messages are missed.
@@ -1184,9 +1444,18 @@ BOOL WhTool_ModInit() {
     Logf(L"Tool mod init (pid=%lu)", GetCurrentProcessId());
     LoadSettings();
 
+    Gdiplus::GdiplusStartupInput gdiplusInput;
+    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) == Gdiplus::Ok) {
+        g_gdiplusReady = true;
+    } else {
+        g_gdiplusToken = 0;
+        Logf(L"GdiplusStartup failed; notifications are disabled");
+    }
+
     g_stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     if (!g_stopEvent) {
         Logf(L"CreateEvent failed: %u", GetLastError());
+        StopGdiplus();
         return FALSE;
     }
 
@@ -1195,6 +1464,7 @@ BOOL WhTool_ModInit() {
         Logf(L"CreateThread (conversion) failed: %u", GetLastError());
         CloseHandle(g_stopEvent);
         g_stopEvent = nullptr;
+        StopGdiplus();
         return FALSE;
     }
 
@@ -1207,6 +1477,7 @@ BOOL WhTool_ModInit() {
         g_convertThread = nullptr;
         CloseHandle(g_stopEvent);
         g_stopEvent = nullptr;
+        StopGdiplus();
         return FALSE;
     }
 
@@ -1243,8 +1514,12 @@ void WhTool_ModUninit() {
         g_toastClass[0] = L'\0';
         g_toastInstance = nullptr;
     }
-    if (g_stopEvent) {
-        CloseHandle(g_stopEvent);
+    if (g_gdiplusReady) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+        g_gdiplusReady = false;
+    }
+    if (g_stopEvent) {        CloseHandle(g_stopEvent);
         g_stopEvent = nullptr;
     }
     memset(g_keyDown, 0, sizeof(g_keyDown));
