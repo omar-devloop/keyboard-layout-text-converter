@@ -2,7 +2,7 @@
 // @id              keyboard-layout-text-converter
 // @name            Keyboard Layout Text Converter
 // @description     Convert mistyped text in place with a shortcut, adapting to installed keyboard layouts
-// @version         0.6.0
+// @version         0.6.1
 // @author          OMAR ALAFA
 // @homepage        https://github.com/omar-devloop/keyboard-layout-text-converter
 // @include         explorer.exe
@@ -28,8 +28,8 @@ Windows applications.
   layout among the keyboard layouts installed on your device, converts the text
   by key positions between layouts, then pastes the converted text back.
 - By default the original clipboard text content is restored after replacement.
-- A small success toast appears in the bottom-right screen corner after each
-  conversion; it can be disabled in the settings.
+- An optional small success toast can be enabled in the settings; it appears in
+  the bottom-right screen corner after each conversion.
 
 ## Examples
 - Typed with English layout but meant as another installed layout (and back),
@@ -68,7 +68,7 @@ Windows applications.
 - restoreClipboard: true
   $name: "Restore clipboard"
   $description: "Restore previous clipboard Unicode text after conversion."
-- showNotification: true
+- showNotification: false
   $name: "Show notification"
   $description: "Show a small success toast in the screen corner after a successful conversion."
 - switchLayout: false
@@ -136,7 +136,7 @@ struct Settings {
     std::wstring scope = L"selection-first";
     bool restoreClipboard = true;
     bool switchLayout = false;
-    bool showNotification = true;
+    bool showNotification = false;
     int actionDelayMs = 40;
 };
 
