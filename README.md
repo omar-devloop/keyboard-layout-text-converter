@@ -11,12 +11,12 @@ Select the mistyped text and press **Left Ctrl + Left Shift**. The mod copies th
 - Supports Latin, Cyrillic, Hebrew, Arabic, and Greek layouts for conversion scoring.
 - Optional clipboard restore and optional keyboard-layout switch after conversion.
 - Optional small success toast in the screen corner (off by default).
-- Runs inside `explorer.exe` as a Windhawk tool mod.
+- Runs inside `explorer.exe`.
 
 ## Install
 
 1. Install [Windhawk](https://windhawk.net/).
-2. In Windhawk, create a new mod from source and paste the contents of [`mod.wh.cpp`](mod.wh.cpp).
+2. In Windhawk, create a new mod from source and paste the contents of [`mods/keyboard-layout-text-converter.wh.cpp`](mods/keyboard-layout-text-converter.wh.cpp).
 3. Compile and enable the mod.
 
 ## Usage
@@ -44,4 +44,8 @@ Select the mistyped text and press **Left Ctrl + Left Shift**. The mod copies th
 
 ## Source
 
-[`mod.wh.cpp`](mod.wh.cpp) contains all mod metadata, settings, and code.
+[`mods/keyboard-layout-text-converter.wh.cpp`](mods/keyboard-layout-text-converter.wh.cpp) contains all mod metadata, settings, and code.
+
+## Submit to the Windhawk mods collection
+
+The mod file follows the [windhawk-mods](https://github.com/ramensoftware/windhawk-mods) layout: `mods/<mod-id>.wh.cpp`. To publish it, open a pull request that adds the single file `mods/keyboard-layout-text-converter.wh.cpp` to that repository.

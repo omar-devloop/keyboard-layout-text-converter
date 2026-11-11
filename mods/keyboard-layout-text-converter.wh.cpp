@@ -4,7 +4,9 @@
 // @description     Convert mistyped text in place with a shortcut, adapting to installed keyboard layouts
 // @version         0.0.1
 // @author          OMAR ALAFA
+// @github          https://github.com/omar-devloop
 // @homepage        https://github.com/omar-devloop/keyboard-layout-text-converter
+// @license         MIT
 // @include         explorer.exe
 // @compilerOptions -luser32 -lkernel32 -lshell32 -lgdi32 -lgdiplus
 // @architecture    x86-64
@@ -43,7 +45,7 @@ Windows applications.
   fields, or some terminals/remote apps.
 - Very short or ambiguous text can be hard to auto-detect; use a longer
   selection or adjust settings if needed.
-- Runs inside `explorer.exe` to provide a global shortcut and conversion worker.
+- Runs inside `explorer.exe`.
 */
 // ==/WindhawkModReadme==
 
@@ -101,11 +103,6 @@ Windows applications.
 #include <vector>
 
 namespace {
-
-void Dbg(const wchar_t* msg) {
-    OutputDebugStringW(msg);
-    OutputDebugStringW(L"\n");
-}
 
 template <typename... Args>
 void Logf(const wchar_t* fmt, Args... args) {
@@ -1440,8 +1437,8 @@ done:
 
 }  // namespace
 
-BOOL WhTool_ModInit() {
-    Logf(L"Tool mod init (pid=%lu)", GetCurrentProcessId());
+BOOL ModInit() {
+    Logf(L"Mod init (pid=%lu)", GetCurrentProcessId());
     LoadSettings();
 
     Gdiplus::GdiplusStartupInput gdiplusInput;
@@ -1484,13 +1481,13 @@ BOOL WhTool_ModInit() {
     return TRUE;
 }
 
-void WhTool_ModSettingsChanged() {
+void ModSettingsChanged() {
     Logf(L"Settings changed");
     LoadSettings();
     RefreshLayoutsIfNeeded(true);
 }
 
-void WhTool_ModUninit() {
+void ModUninit() {
     Logf(L"Uninit");
     if (g_stopEvent) {
         SetEvent(g_stopEvent);
@@ -1536,16 +1533,16 @@ BOOL Wh_ModInit() {
          GetCurrentProcessId(), sessionId, GetCommandLineW() ? GetCommandLineW() : L"");
 
     // Run in explorer.exe as a simple in-process tool.
-    return WhTool_ModInit() ? TRUE : FALSE;
+    return ModInit() ? TRUE : FALSE;
 }
 
 void Wh_ModAfterInit() {}
 
 void Wh_ModSettingsChanged() {
-    WhTool_ModSettingsChanged();
+    ModSettingsChanged();
 }
 
 void Wh_ModUninit() {
-    WhTool_ModUninit();
+    ModUninit();
 }
 
