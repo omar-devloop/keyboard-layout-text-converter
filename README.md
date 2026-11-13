@@ -9,7 +9,7 @@ Select the mistyped text and press **Alt+X**. The mod copies the selection, rema
 - Converts a selection with a global shortcut, with an optional previous-word fallback.
 - Detects the most plausible source/target layout among the installed layouts, or cycles through them.
 - Supports Latin, Cyrillic, Hebrew, Arabic, and Greek layouts for conversion scoring.
-- Optional full clipboard restore (all formats) and optional keyboard-layout switch after conversion.
+- Optional full clipboard restore (all formats, up to 128 MB per format) and optional keyboard-layout switch after conversion.
 - Optional small success toast in the screen corner (off by default).
 - Runs as a Windhawk tool mod in a dedicated `windhawk.exe` process.
 
@@ -30,21 +30,25 @@ Select the mistyped text and press **Alt+X**. The mod copies the selection, rema
 - **Conversion shortcut** — global shortcut; a regular combination such as `Alt+X` is recommended, since modifier-only combinations can collide with Windows actions (for example `Ctrl+Shift` switches the keyboard layout).
 - **Conversion mode** — auto-detect layouts or cycle through installed layouts.
 - **Capture scope** — selection with previous-word fallback, selection only, or previous word only.
-- **Restore clipboard** — restore the previous clipboard content, in all of its formats, after conversion.
+- **Restore clipboard** — restore the previous clipboard content, in all of its formats, after conversion. Formats above 128 MB (or 256 MB in total) can't be preserved, and the conversion is skipped in that case.
 - **Show notification** - show a small success toast in the screen corner after conversion (off by default).
 - **Switch keyboard layout after convert** — switch to the detected target layout.
-- **Clipboard wait (ms)** — minimum wait for the clipboard after copy and paste; raise it for slow applications.
+- **Clipboard wait (ms)** — time to wait for the clipboard after copy and to wait after pasting before restoring it; values below 150 are raised to 150. Raise it for slow applications.
 
 ## Notes and limitations
 
 - Replacement is clipboard-based (simulated copy/paste), so behavior can vary in apps with custom clipboard/shortcut handling.
 - The mod may not interact with elevated (UIPI) windows, secure fields, or some terminals/remote apps.
 - Modifier-only shortcuts only fire when the keys are pressed and released on their own. Pressing another key (e.g. `Ctrl+Shift+T`) cancels the shortcut, so normal `Ctrl+Shift+...` shortcuts keep working. They can still collide with Windows actions such as switching the keyboard layout, which is why a regular combination is the default.
+- In console windows the copy uses `Ctrl+Insert` instead of `Ctrl+C`, because `Ctrl+C` without a selection discards the typed line and interrupts a running command. The previous-word fallback is skipped there, so select the text instead. Editors such as VS Code or Visual Studio copy the current line when nothing is selected, so pressing the shortcut without a selection can paste an extra line there; the *selection-only* scope doesn't avoid this.
 - Very short or ambiguous text can be hard to auto-detect; use a longer selection or adjust settings if needed.
 
 ## Similar mods
 
-[Arabic Keyboard Layout Fixer](https://windhawk.net/mods/arabic-keyboard-layout-fixer) converts between a fixed Arabic/English pair. This mod builds the mapping from every installed layout, and adds a previous-word fallback, cycle mode, optional layout switching and a toast.
+- [Arabic Keyboard Layout Fixer](https://windhawk.net/mods/arabic-keyboard-layout-fixer) converts between a fixed Arabic/English pair.
+- [Quick translator & Layout-switcher](https://windhawk.net/mods/quick-translator-layout-switcher) converts between a fixed English/Russian pair, with optional online translation.
+
+Both use a fixed layout pair. This mod builds the mapping from every installed layout, and adds a previous-word fallback, cycle mode, optional layout switching and a toast.
 
 ## Source
 
