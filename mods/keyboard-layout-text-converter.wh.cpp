@@ -346,7 +346,9 @@ Hotkey ParseHotkey(const std::wstring& text) {
     }
     hk.modifiers = mods;
     hk.vk = vk;
-    hk.modifierOnly = (vk == 0 && mods != 0);
+    // An unknown or duplicate key name invalidates the whole shortcut; it must
+    // not silently degrade to a modifier-only one.
+    hk.modifierOnly = !badToken && vk == 0 && mods != 0;
     hk.valid = !badToken && ((vk != 0) || hk.modifierOnly);
     if (vk != 0) {
         // Side-specific info is only meaningful for modifier-only shortcuts.
